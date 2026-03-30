@@ -65,6 +65,7 @@ use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_core::config::Config;
 use codex_core::message_history;
+use codex_core::read_session_meta_line;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelAvailabilityNux;
@@ -1071,13 +1072,28 @@ async fn thread_session_state_from_thread_response(
 ) -> Result<ThreadSessionState, String> {
     let thread_id = ThreadId::from_string(thread_id)
         .map_err(|err| format!("thread id `{thread_id}` is invalid: {err}"))?;
-    let forked_from_id = forked_from_id
+    let parsed_forked_from_id = forked_from_id
         .as_deref()
         .map(ThreadId::from_string)
         .transpose()
         .map_err(|err| format!("forked_from_id is invalid: {err}"))?;
     let (history_log_id, history_entry_count) = message_history::history_metadata(config).await;
     let history_entry_count = u64::try_from(history_entry_count).unwrap_or(u64::MAX);
+    let forked_from_id = if let Some(path) = rollout_path.as_deref() {
+        match read_session_meta_line(path).await {
+            Ok(meta_line) => meta_line.meta.forked_from_id,
+            Err(err) => {
+                tracing::debug!(
+                    rollout_path = %path.display(),
+                    %err,
+                    "failed to read session metadata for thread fork ancestry"
+                );
+                parsed_forked_from_id
+            }
+        }
+    } else {
+        parsed_forked_from_id
+    };
 
     Ok(ThreadSessionState {
         thread_id,
