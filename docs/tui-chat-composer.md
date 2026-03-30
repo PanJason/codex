@@ -65,6 +65,28 @@ Up/Down recall is handled by `ChatComposerHistory` and merges two sources:
 This distinction keeps the on-disk history backward compatible and avoids persisting attachments,
 while still providing a richer recall experience for in-session edits.
 
+### Reverse search (`Ctrl+R`)
+
+The composer also supports shell-style backward incremental search while the prompt has focus.
+
+- Press `Ctrl+R` to enter reverse search.
+- Type a Rust-style regex to search previously submitted user prompts.
+- While active, the footer shows `bck-i-search` and the composer preview switches to the current
+  match.
+- Press `Ctrl+R` again to move to the next older match.
+- Press `Enter` to accept the shown match into the draft.
+- Press `Esc` or `Ctrl+G` to cancel and restore the original draft.
+
+Search order is:
+
+- current thread first, newest prompt to oldest prompt
+- then other threads in the same fork family
+
+When a match is visible, the composer moves the cursor to the start of the matched span and
+underlines the matched text. Empty queries keep the original draft visible, and mirrored rollout
+records for the same submitted prompt are collapsed so each `Ctrl+R` press advances by one visible
+history entry.
+
 ## Config gating for reuse
 
 `ChatComposer` now supports feature gating via `ChatComposerConfig`
