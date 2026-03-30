@@ -1034,6 +1034,13 @@ impl ChatComposer {
         }
     }
 
+    fn apply_reverse_search_cursor(&mut self, match_start: Option<usize>) {
+        self.textarea.set_highlight_range(None);
+        if let Some(match_start) = match_start {
+            self.textarea.set_cursor(match_start);
+        }
+    }
+
     fn apply_reverse_search_match(&mut self, match_range: Option<std::ops::Range<usize>>) {
         self.textarea.set_highlight_range(match_range.clone());
         if let Some(match_range) = match_range {
@@ -2579,10 +2586,13 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                let match_range = self.reverse_search.current_match_range();
+                let match_start = self
+                    .reverse_search
+                    .current_match_range()
+                    .map(|match_range| match_range.start);
                 if let Some(entry) = self.reverse_search.accept() {
                     self.apply_history_entry(entry);
-                    self.apply_reverse_search_match(match_range);
+                    self.apply_reverse_search_cursor(match_start);
                     return (InputResult::None, true);
                 }
                 (InputResult::None, false)
@@ -4400,6 +4410,55 @@ mod tests {
                 "expected cell ({x}, {y}) to be underlined",
             );
         }
+    }
+
+    #[test]
+    fn reverse_search_accept_keeps_cursor_and_clears_highlight() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ true,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("thread id");
+        composer.set_reverse_search_context(Some(ReverseSearchContext {
+            thread_id,
+            forked_from_id: None,
+            rollout_path: None,
+        }));
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(composer.on_reverse_search_entries_loaded(
+            thread_id,
+            /*request_id*/ 1,
+            Ok(vec![ReverseSearchEntry {
+                thread_id,
+                text: "fix reverse search".to_string(),
+            }]),
+        ));
+        for ch in ['s', 'e', 'a', 'r', 'c', 'h'] {
+            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        assert_eq!(composer.textarea.cursor(), "fix reverse ".len());
+        assert_eq!(
+            composer.textarea.highlight_range(),
+            Some("fix reverse ".len().."fix reverse search".len())
+        );
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(composer.textarea.cursor(), "fix reverse ".len());
+        assert_eq!(composer.textarea.highlight_range(), None);
+        assert!(!composer.reverse_search.is_active());
     }
 
     #[test]

@@ -157,6 +157,11 @@ impl TextArea {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn highlight_range(&self) -> Option<Range<usize>> {
+        self.highlight_range.clone()
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
