@@ -30,6 +30,8 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::history_cell::HistoryCell;
+use crate::reverse_search::ReverseSearchContext;
+use crate::reverse_search::ReverseSearchEntry;
 
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
@@ -93,6 +95,19 @@ pub(crate) enum AppEvent {
     ThreadHistoryEntryResponse {
         thread_id: ThreadId,
         event: GetHistoryEntryResponseEvent,
+    },
+
+    /// Load reverse-search entries for the active thread and its related forks.
+    LoadReverseSearchEntries {
+        request_id: u64,
+        context: ReverseSearchContext,
+    },
+
+    /// Deliver the asynchronously loaded reverse-search corpus back to the composer.
+    ReverseSearchEntriesLoaded {
+        thread_id: ThreadId,
+        request_id: u64,
+        result: Result<Vec<ReverseSearchEntry>, String>,
     },
 
     /// Start a new session.

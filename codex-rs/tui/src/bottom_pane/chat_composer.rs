@@ -166,6 +166,7 @@ use super::footer::toggle_shortcut_mode;
 use super::footer::uses_passive_footer_status_layout;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
+use super::reverse_search_state::ReverseSearchState;
 use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
 use super::slash_commands;
@@ -175,6 +176,8 @@ use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::render::renderable::Renderable;
+use crate::reverse_search::ReverseSearchContext;
+use crate::reverse_search::ReverseSearchEntry;
 use crate::slash_command::SlashCommand;
 use crate::style::user_message_style;
 use codex_protocol::models::local_image_label_text;
@@ -283,6 +286,9 @@ pub(crate) struct ChatComposer {
     active_popup: ActivePopup,
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
+    reverse_search: ReverseSearchState,
+    reverse_search_context: Option<ReverseSearchContext>,
+    next_reverse_search_request_id: u64,
     quit_shortcut_expires_at: Option<Instant>,
     quit_shortcut_key: KeyBinding,
     esc_backtrack_hint: bool,
@@ -413,6 +419,9 @@ impl ChatComposer {
             active_popup: ActivePopup::None,
             app_event_tx,
             history: ChatComposerHistory::new(),
+            reverse_search: ReverseSearchState::default(),
+            reverse_search_context: None,
+            next_reverse_search_request_id: 1,
             quit_shortcut_expires_at: None,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             esc_backtrack_hint: false,
@@ -474,6 +483,12 @@ impl ChatComposer {
 
     pub(crate) fn set_frame_requester(&mut self, frame_requester: FrameRequester) {
         self.frame_requester = Some(frame_requester);
+    }
+
+    pub(crate) fn set_reverse_search_context(&mut self, context: Option<ReverseSearchContext>) {
+        self.reverse_search = ReverseSearchState::default();
+        self.reverse_search_context = context;
+        self.active_popup = ActivePopup::None;
     }
 
     pub fn set_skill_mentions(&mut self, skills: Option<Vec<SkillMetadata>>) {
@@ -632,7 +647,8 @@ impl ChatComposer {
     }
     /// Returns true if the composer currently contains no user-entered input.
     pub(crate) fn is_empty(&self) -> bool {
-        self.textarea.is_empty()
+        !self.reverse_search.is_active()
+            && self.textarea.is_empty()
             && self.attached_images.is_empty()
             && self.remote_image_urls.is_empty()
     }
@@ -641,6 +657,37 @@ impl ChatComposer {
     /// that the composer can navigate cross-session history.
     pub(crate) fn set_history_metadata(&mut self, log_id: u64, entry_count: usize) {
         self.history.set_metadata(log_id, entry_count);
+    }
+
+    pub(crate) fn on_reverse_search_entries_loaded(
+        &mut self,
+        thread_id: codex_protocol::ThreadId,
+        request_id: u64,
+        result: Result<Vec<ReverseSearchEntry>, String>,
+    ) -> bool {
+        if !self
+            .reverse_search
+            .install_entries(thread_id, request_id, result)
+        {
+            return false;
+        }
+        self.apply_reverse_search_display();
+        true
+    }
+
+    pub(crate) fn cancel_reverse_search(&mut self) -> bool {
+        let Some(draft) = self.reverse_search.cancel() else {
+            return false;
+        };
+        self.apply_history_entry(draft);
+        true
+    }
+
+    pub(crate) fn draft_snapshot(&self) -> HistoryEntry {
+        self.reverse_search
+            .original_draft()
+            .cloned()
+            .unwrap_or_else(|| self.visible_draft_snapshot())
     }
 
     /// Integrate an asynchronous response to an on-demand history lookup.
@@ -683,6 +730,11 @@ impl ChatComposer {
     /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
     /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        if self.reverse_search.is_active() {
+            self.reverse_search.append_query_str(&pasted);
+            self.apply_reverse_search_display();
+            return true;
+        }
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
@@ -862,6 +914,7 @@ impl ChatComposer {
         self.sync_popups();
     }
 
+    #[cfg(test)]
     pub(crate) fn remote_image_urls(&self) -> Vec<String> {
         self.remote_image_urls.clone()
     }
@@ -959,30 +1012,52 @@ impl ChatComposer {
         self.sync_popups();
     }
 
+    fn visible_draft_snapshot(&self) -> HistoryEntry {
+        HistoryEntry {
+            text: self.textarea.text().to_string(),
+            text_elements: self.textarea.text_elements(),
+            local_image_paths: self
+                .attached_images
+                .iter()
+                .map(|img| img.path.clone())
+                .collect(),
+            remote_image_urls: self.remote_image_urls.clone(),
+            mention_bindings: self.snapshot_mention_bindings(),
+            pending_pastes: self.pending_pastes.clone(),
+        }
+    }
+
+    fn apply_reverse_search_display(&mut self) {
+        if let Some(entry) = self.reverse_search.display_entry() {
+            self.apply_history_entry(entry);
+            self.apply_reverse_search_match(self.reverse_search.current_match_range());
+        }
+    }
+
+    fn apply_reverse_search_match(&mut self, match_range: Option<std::ops::Range<usize>>) {
+        self.textarea.set_highlight_range(match_range.clone());
+        if let Some(match_range) = match_range {
+            self.textarea.set_cursor(match_range.start);
+        }
+    }
+
     pub(crate) fn clear_for_ctrl_c(&mut self) -> Option<String> {
         if self.is_empty() {
             return None;
         }
-        let previous = self.current_text();
-        let text_elements = self.textarea.text_elements();
-        let local_image_paths = self
-            .attached_images
-            .iter()
-            .map(|img| img.path.clone())
-            .collect();
+        let snapshot = self.visible_draft_snapshot();
+        let previous = snapshot.text.clone();
         let pending_pastes = std::mem::take(&mut self.pending_pastes);
-        let remote_image_urls = self.remote_image_urls.clone();
-        let mention_bindings = self.snapshot_mention_bindings();
         self.set_text_content(String::new(), Vec::new(), Vec::new());
         self.remote_image_urls.clear();
         self.selected_remote_image_index = None;
         self.history.reset_navigation();
         self.history.record_local_submission(HistoryEntry {
             text: previous.clone(),
-            text_elements,
-            local_image_paths,
-            remote_image_urls,
-            mention_bindings,
+            text_elements: snapshot.text_elements,
+            local_image_paths: snapshot.local_image_paths,
+            remote_image_urls: snapshot.remote_image_urls,
+            mention_bindings: snapshot.mention_bindings,
             pending_pastes,
         });
         Some(previous)
@@ -1052,6 +1127,7 @@ impl ChatComposer {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn mention_bindings(&self) -> Vec<MentionBinding> {
         self.snapshot_mention_bindings()
     }
@@ -1203,6 +1279,10 @@ impl ChatComposer {
             return (InputResult::None, false);
         }
 
+        if self.reverse_search.is_active() {
+            return self.handle_reverse_search_key_event(key_event);
+        }
+
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
@@ -1216,7 +1296,7 @@ impl ChatComposer {
 
     /// Return true if either the slash-command popup or the file-search popup is active.
     pub(crate) fn popup_active(&self) -> bool {
-        !matches!(self.active_popup, ActivePopup::None)
+        self.reverse_search.is_active() || !matches!(self.active_popup, ActivePopup::None)
     }
 
     /// Handle key event when the slash-command popup is visible.
@@ -2459,6 +2539,76 @@ impl ChatComposer {
         }
     }
 
+    fn start_reverse_search(&mut self) -> bool {
+        let Some(context) = self.reverse_search_context.clone() else {
+            return false;
+        };
+        let request_id = self.next_reverse_search_request_id;
+        self.next_reverse_search_request_id = self.next_reverse_search_request_id.saturating_add(1);
+        self.reverse_search
+            .begin(context.thread_id, request_id, self.visible_draft_snapshot());
+        self.app_event_tx.send(AppEvent::LoadReverseSearchEntries {
+            request_id,
+            context,
+        });
+        true
+    }
+
+    fn handle_reverse_search_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.reverse_search.cycle_backwards();
+                self.apply_reverse_search_display();
+                (InputResult::None, true)
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => (InputResult::None, self.cancel_reverse_search()),
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                let match_range = self.reverse_search.current_match_range();
+                if let Some(entry) = self.reverse_search.accept() {
+                    self.apply_history_entry(entry);
+                    self.apply_reverse_search_match(match_range);
+                    return (InputResult::None, true);
+                }
+                (InputResult::None, false)
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.reverse_search.pop_query_char();
+                self.apply_reverse_search_display();
+                (InputResult::None, true)
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if !has_ctrl_or_alt(modifiers) => {
+                self.reverse_search.append_query_char(ch);
+                self.apply_reverse_search_display();
+                (InputResult::None, true)
+            }
+            _ => (InputResult::None, true),
+        }
+    }
+
     /// Handle key event when no popup is visible.
     fn handle_key_event_without_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
         if let Some((result, redraw)) = self.handle_remote_image_selection_key(&key_event) {
@@ -2482,6 +2632,12 @@ impl ChatComposer {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
         match key_event {
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => (InputResult::None, self.start_reverse_search()),
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
@@ -2844,6 +3000,9 @@ impl ChatComposer {
         if self.footer_flash_visible() {
             return Some(1);
         }
+        if self.reverse_search.is_active() {
+            return Some(1);
+        }
         self.footer_hint_override
             .as_ref()
             .map(|items| if items.is_empty() { 0 } else { 1 })
@@ -2852,6 +3011,15 @@ impl ChatComposer {
     pub(crate) fn sync_popups(&mut self) {
         self.sync_slash_command_elements();
         if !self.popups_enabled() {
+            self.active_popup = ActivePopup::None;
+            return;
+        }
+        if self.reverse_search.is_active() {
+            if self.current_file_query.is_some() {
+                self.app_event_tx
+                    .send(AppEvent::StartFileSearch(String::new()));
+                self.current_file_query = None;
+            }
             self.active_popup = ActivePopup::None;
             return;
         }
@@ -3503,6 +3671,10 @@ impl ChatComposer {
                 };
                 let available_width =
                     hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                let reverse_search_line = self
+                    .reverse_search
+                    .footer_line()
+                    .map(|line| truncate_line_with_ellipsis_if_overflow(line, available_width));
                 let status_line_active = uses_passive_footer_status_layout(&footer_props);
                 let combined_status_line = if status_line_active {
                     passive_footer_status_line(&footer_props).map(ratatui::prelude::Stylize::dim)
@@ -3526,6 +3698,8 @@ impl ChatComposer {
                         .as_ref()
                         .map(|flash| flash.line.width() as u16)
                         .unwrap_or(0)
+                } else if let Some(line) = reverse_search_line.as_ref() {
+                    line.width() as u16
                 } else if let Some(items) = self.footer_hint_override.as_ref() {
                     footer_hint_items_width(items)
                 } else if status_line_active {
@@ -3574,8 +3748,9 @@ impl ChatComposer {
                 }
                 let can_show_left_and_context =
                     can_show_left_with_context(hint_rect, left_width, right_width);
-                let has_override =
-                    self.footer_flash_visible() || self.footer_hint_override.is_some();
+                let has_override = self.footer_flash_visible()
+                    || self.footer_hint_override.is_some()
+                    || reverse_search_line.is_some();
                 let single_line_layout = if has_override || status_line_active {
                     None
                 } else {
@@ -3604,7 +3779,8 @@ impl ChatComposer {
                     FooterMode::EscHint
                         | FooterMode::QuitShortcutReminder
                         | FooterMode::ShortcutOverlay
-                ) {
+                ) || reverse_search_line.is_some()
+                {
                     false
                 } else {
                     single_line_layout
@@ -3651,6 +3827,8 @@ impl ChatComposer {
                     if let Some(flash) = self.footer_flash.as_ref() {
                         flash.line.render(inset_footer_hint_area(hint_rect), buf);
                     }
+                } else if let Some(line) = reverse_search_line {
+                    render_footer_line(hint_rect, buf, line);
                 } else if let Some(items) = self.footer_hint_override.as_ref() {
                     render_footer_hint_items(hint_rect, buf, items);
                 } else if status_line_active {
@@ -3781,6 +3959,7 @@ impl ChatComposer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::ThreadId;
     use image::ImageBuffer;
     use image::Rgba;
     use pretty_assertions::assert_eq;
@@ -3971,7 +4150,9 @@ mod tests {
         );
         setup(&mut composer);
         let footer_props = composer.footer_props();
-        let footer_lines = footer_height(&footer_props);
+        let footer_lines = composer
+            .custom_footer_height()
+            .unwrap_or_else(|| footer_height(&footer_props));
         let footer_spacing = ChatComposer::footer_spacing(footer_lines);
         let height = footer_lines + footer_spacing + 8;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -4109,6 +4290,116 @@ mod tests {
                 type_chars_humanlike(composer, &['h']);
             },
         );
+    }
+
+    #[test]
+    fn reverse_search_snapshot() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        snapshot_composer_state(
+            "reverse_search_active",
+            /*enhanced_keys_supported*/ true,
+            |composer| {
+                let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+                    .expect("thread id");
+                composer.set_reverse_search_context(Some(ReverseSearchContext {
+                    thread_id,
+                    forked_from_id: None,
+                    rollout_path: None,
+                }));
+                composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+
+                let _ = composer
+                    .handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+                assert!(composer.on_reverse_search_entries_loaded(
+                    thread_id,
+                    /*request_id*/ 1,
+                    Ok(vec![
+                        ReverseSearchEntry {
+                            thread_id,
+                            text: "fix reverse search".to_string(),
+                        },
+                        ReverseSearchEntry {
+                            thread_id,
+                            text: "fork search state".to_string(),
+                        },
+                    ]),
+                ));
+                for ch in ['s', 'e', 'a', 'r', 'c', 'h'] {
+                    let _ = composer
+                        .handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn reverse_search_underlines_current_match() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use ratatui::style::Modifier;
+        use unicode_width::UnicodeWidthStr;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ true,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("thread id");
+        composer.set_reverse_search_context(Some(ReverseSearchContext {
+            thread_id,
+            forked_from_id: None,
+            rollout_path: None,
+        }));
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(composer.on_reverse_search_entries_loaded(
+            thread_id,
+            /*request_id*/ 1,
+            Ok(vec![ReverseSearchEntry {
+                thread_id,
+                text: "fix reverse search".to_string(),
+            }]),
+        ));
+        for ch in ['s', 'e', 'a', 'r', 'c', 'h'] {
+            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+
+        let mut match_row = None;
+        for y in 0..area.height {
+            let row = (0..area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>();
+            if row.contains("fix reverse search") {
+                let start = row.rfind("search").expect("search substring in prompt row");
+                let start_col = row[..start].width();
+                match_row = Some((y, start_col));
+                break;
+            }
+        }
+
+        let (y, start) = match_row.expect("rendered match row");
+        for x in start..start + "search".len() {
+            assert!(
+                buf[(x as u16, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::UNDERLINED),
+                "expected cell ({x}, {y}) to be underlined",
+            );
+        }
     }
 
     #[test]
@@ -4348,6 +4639,77 @@ mod tests {
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
         );
+    }
+
+    #[test]
+    fn ctrl_r_reverse_search_loads_matches_and_cancel_restores_draft() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("thread id");
+        composer.set_reverse_search_context(Some(ReverseSearchContext {
+            thread_id,
+            forked_from_id: None,
+            rollout_path: None,
+        }));
+        composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+
+        let (result, needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert_eq!(InputResult::None, result);
+        assert!(needs_redraw);
+        match rx.try_recv() {
+            Ok(AppEvent::LoadReverseSearchEntries {
+                request_id,
+                context,
+            }) => {
+                assert_eq!(request_id, 1);
+                assert_eq!(context.thread_id, thread_id);
+            }
+            Ok(event) => panic!("unexpected event: {event:?}"),
+            Err(err) => panic!("expected reverse-search load request, got {err:?}"),
+        }
+
+        assert!(composer.on_reverse_search_entries_loaded(
+            thread_id,
+            /*request_id*/ 1,
+            Ok(vec![
+                ReverseSearchEntry {
+                    thread_id,
+                    text: "alpha beta".to_string(),
+                },
+                ReverseSearchEntry {
+                    thread_id,
+                    text: "beta".to_string(),
+                },
+            ]),
+        ));
+        assert_eq!(composer.current_text(), "draft");
+
+        for ch in ['b', 'e', 't'] {
+            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(composer.current_text(), "alpha beta");
+        assert_eq!(composer.textarea.cursor(), "alpha ".len());
+
+        let (result, needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(InputResult::None, result);
+        assert!(needs_redraw);
+        assert_eq!(composer.current_text(), "draft");
+        assert!(!composer.popup_active());
     }
 
     #[test]

@@ -19,6 +19,8 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
@@ -61,6 +63,7 @@ pub(crate) struct TextElementSnapshot {
 pub(crate) struct TextArea {
     text: String,
     cursor_pos: usize,
+    highlight_range: Option<Range<usize>>,
     wrap_cache: RefCell<Option<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
@@ -85,6 +88,7 @@ impl TextArea {
         Self {
             text: String::new(),
             cursor_pos: 0,
+            highlight_range: None,
             wrap_cache: RefCell::new(None),
             preferred_col: None,
             elements: Vec::new(),
@@ -116,6 +120,7 @@ impl TextArea {
         // Stage 1: replace the raw text and keep the cursor in a safe byte range.
         self.text = text.to_string();
         self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
+        self.highlight_range = None;
         // Stage 2: rebuild element ranges from scratch against the new text.
         self.elements.clear();
         if let Some(elements) = elements {
@@ -142,6 +147,14 @@ impl TextArea {
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
         self.wrap_cache.replace(None);
         self.preferred_col = None;
+    }
+
+    pub(crate) fn set_highlight_range(&mut self, range: Option<Range<usize>>) {
+        self.highlight_range = range.and_then(|range| {
+            let start = self.clamp_pos_to_char_boundary(range.start.min(self.text.len()));
+            let end = self.clamp_pos_to_char_boundary(range.end.min(self.text.len()));
+            (start < end).then_some(start..end)
+        });
     }
 
     pub fn text(&self) -> &str {
@@ -1403,6 +1416,23 @@ impl TextArea {
                 let x_off = self.text[line_range.start..overlap_start].width() as u16;
                 let style = base_style.fg(ratatui::style::Color::Cyan);
                 buf.set_string(area.x + x_off, y, styled, style);
+            }
+
+            if let Some(highlight_range) = &self.highlight_range {
+                let overlap_start = highlight_range.start.max(line_range.start);
+                let overlap_end = highlight_range.end.min(line_range.end);
+                if overlap_start < overlap_end {
+                    let highlighted = &self.text[overlap_start..overlap_end];
+                    let x_off = self.text[line_range.start..overlap_start].width() as u16;
+                    let overlaps_element = self.elements.iter().any(|elem| {
+                        overlap_start < elem.range.end && elem.range.start < overlap_end
+                    });
+                    let mut style = Style::default().add_modifier(Modifier::UNDERLINED);
+                    if overlaps_element {
+                        style = style.fg(Color::Cyan);
+                    }
+                    buf.set_string(area.x + x_off, y, highlighted, style);
+                }
             }
         }
     }

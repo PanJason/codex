@@ -25,6 +25,8 @@ use crate::key_hint::KeyBinding;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
+use crate::reverse_search::ReverseSearchContext;
+use crate::reverse_search::ReverseSearchEntry;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
 use codex_core::plugins::PluginCapabilitySummary;
@@ -82,6 +84,7 @@ mod file_search_popup;
 mod footer;
 mod list_selection_view;
 mod prompt_args;
+mod reverse_search_state;
 mod skill_popup;
 mod skills_toggle_view;
 mod slash_commands;
@@ -146,6 +149,7 @@ use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
+use chat_composer_history::HistoryEntry;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
@@ -278,6 +282,26 @@ impl BottomPane {
 
     pub fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         self.composer.take_recent_submission_mention_bindings()
+    }
+
+    pub(crate) fn set_reverse_search_context(&mut self, context: Option<ReverseSearchContext>) {
+        self.composer.set_reverse_search_context(context);
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_reverse_search_entries_loaded(
+        &mut self,
+        thread_id: codex_protocol::ThreadId,
+        request_id: u64,
+        result: Result<Vec<ReverseSearchEntry>, String>,
+    ) -> bool {
+        let applied = self
+            .composer
+            .on_reverse_search_entries_loaded(thread_id, request_id, result);
+        if applied {
+            self.request_redraw();
+        }
+        applied
     }
 
     /// Clear pending attachments and mention bindings e.g. when a slash command doesn't submit text.
@@ -467,6 +491,9 @@ impl BottomPane {
                 self.request_redraw();
             }
             event
+        } else if self.composer.cancel_reverse_search() {
+            self.request_redraw();
+            CancellationEvent::Handled
         } else if self.composer_is_empty() {
             CancellationEvent::NotHandled
         } else {
@@ -569,14 +596,21 @@ impl BottomPane {
         self.composer.current_text()
     }
 
+    pub(crate) fn composer_draft_snapshot(&self) -> HistoryEntry {
+        self.composer.draft_snapshot()
+    }
+
+    #[cfg(test)]
     pub(crate) fn composer_text_elements(&self) -> Vec<TextElement> {
         self.composer.text_elements()
     }
 
+    #[cfg(test)]
     pub(crate) fn composer_local_images(&self) -> Vec<LocalImageAttachment> {
         self.composer.local_images()
     }
 
+    #[cfg(test)]
     pub(crate) fn composer_mention_bindings(&self) -> Vec<MentionBinding> {
         self.composer.mention_bindings()
     }
@@ -590,6 +624,7 @@ impl BottomPane {
         self.composer.current_text_with_pending()
     }
 
+    #[cfg(test)]
     pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
         self.composer.pending_pastes()
     }
@@ -609,6 +644,7 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    #[cfg(test)]
     pub(crate) fn remote_image_urls(&self) -> Vec<String> {
         self.composer.remote_image_urls()
     }

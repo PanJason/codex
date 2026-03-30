@@ -155,12 +155,14 @@ mod app_server_adapter;
 mod app_server_requests;
 mod loaded_threads;
 mod pending_interactive_replay;
+mod reverse_search_loader;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
 use self::app_server_requests::PendingAppServerRequests;
 use self::loaded_threads::find_loaded_subagent_threads_for_primary;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
+use self::reverse_search_loader::spawn_reverse_search_loader;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -4274,6 +4276,25 @@ impl App {
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
+            }
+            AppEvent::LoadReverseSearchEntries {
+                request_id,
+                context,
+            } => {
+                spawn_reverse_search_loader(
+                    self.app_event_tx.clone(),
+                    self.config.codex_home.clone(),
+                    request_id,
+                    context,
+                );
+            }
+            AppEvent::ReverseSearchEntriesLoaded {
+                thread_id,
+                request_id,
+                result,
+            } => {
+                self.chat_widget
+                    .on_reverse_search_entries_loaded(thread_id, request_id, result);
             }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane

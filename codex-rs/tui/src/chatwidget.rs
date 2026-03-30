@@ -56,6 +56,7 @@ use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
+use crate::reverse_search::ReverseSearchContext;
 use crate::status::RateLimitWindowDisplay;
 use crate::status::StatusAccountDisplay;
 use crate::status::StatusHistoryHandle;
@@ -1934,6 +1935,12 @@ impl ChatWidget {
     fn on_session_configured(&mut self, event: codex_protocol::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
+        self.bottom_pane
+            .set_reverse_search_context(Some(ReverseSearchContext {
+                thread_id: event.session_id,
+                forked_from_id: event.forked_from_id,
+                rollout_path: event.rollout_path.clone(),
+            }));
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
@@ -3070,12 +3077,22 @@ impl ChatWidget {
             return None;
         }
 
+        let composer_draft = self.bottom_pane.composer_draft_snapshot();
+        let remote_image_offset = composer_draft.remote_image_urls.len();
         let existing_message = UserMessage {
-            text: self.bottom_pane.composer_text(),
-            text_elements: self.bottom_pane.composer_text_elements(),
-            local_images: self.bottom_pane.composer_local_images(),
-            remote_image_urls: self.bottom_pane.remote_image_urls(),
-            mention_bindings: self.bottom_pane.composer_mention_bindings(),
+            text: composer_draft.text,
+            text_elements: composer_draft.text_elements,
+            local_images: composer_draft
+                .local_image_paths
+                .into_iter()
+                .enumerate()
+                .map(|(idx, path)| LocalImageAttachment {
+                    placeholder: local_image_label_text(remote_image_offset + idx + 1),
+                    path,
+                })
+                .collect(),
+            remote_image_urls: composer_draft.remote_image_urls,
+            mention_bindings: composer_draft.mention_bindings,
         };
 
         let mut to_merge: Vec<UserMessage> = self.rejected_steers_queue.drain(..).collect();
@@ -3114,13 +3131,23 @@ impl ChatWidget {
     }
 
     pub(crate) fn capture_thread_input_state(&self) -> Option<ThreadInputState> {
+        let composer_draft = self.bottom_pane.composer_draft_snapshot();
+        let remote_image_offset = composer_draft.remote_image_urls.len();
         let composer = ThreadComposerState {
-            text: self.bottom_pane.composer_text(),
-            text_elements: self.bottom_pane.composer_text_elements(),
-            local_images: self.bottom_pane.composer_local_images(),
-            remote_image_urls: self.bottom_pane.remote_image_urls(),
-            mention_bindings: self.bottom_pane.composer_mention_bindings(),
-            pending_pastes: self.bottom_pane.composer_pending_pastes(),
+            text: composer_draft.text,
+            text_elements: composer_draft.text_elements,
+            local_images: composer_draft
+                .local_image_paths
+                .into_iter()
+                .enumerate()
+                .map(|(idx, path)| LocalImageAttachment {
+                    placeholder: local_image_label_text(remote_image_offset + idx + 1),
+                    path,
+                })
+                .collect(),
+            remote_image_urls: composer_draft.remote_image_urls,
+            mention_bindings: composer_draft.mention_bindings,
+            pending_pastes: composer_draft.pending_pastes,
         };
         Some(ThreadInputState {
             composer: composer.has_content().then_some(composer),
@@ -3915,6 +3942,17 @@ impl ChatWidget {
         } = event;
         self.bottom_pane
             .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
+    }
+
+    pub(crate) fn on_reverse_search_entries_loaded(
+        &mut self,
+        thread_id: ThreadId,
+        request_id: u64,
+        result: Result<Vec<crate::reverse_search::ReverseSearchEntry>, String>,
+    ) {
+        let _ = self
+            .bottom_pane
+            .on_reverse_search_entries_loaded(thread_id, request_id, result);
     }
 
     fn on_shutdown_complete(&mut self) {
